@@ -1,12 +1,13 @@
 from fastapi import FastAPI, HTTPException, Request
+from requests.adapters import HTTPAdapter, Retry
 from pydantic import BaseModel
 from typing import List, Tuple
 from datetime import datetime, timedelta
+from dotenv import load_dotenv
 import uvicorn
 import base64
 import requests
 import os
-from dotenv import load_dotenv
 
 load_dotenv()
 
@@ -37,9 +38,19 @@ def encode_basic_auth(username, password):
 def determine_date_range(orders: List[ShopifyOrder]) -> Tuple[str, str]:
     dates = [datetime.fromisoformat(
         order.createdAt.replace("Z", "+00:00")) for order in orders]
-    start_date = min(dates) - timedelta(days=1)
+    start_date = min(dates) - timedelta(days=3)
     end_date = max(dates)
     return start_date.strftime('%Y-%m-%dT%H:%M:%SZ'), end_date.strftime('%Y-%m-%dT%H:%M:%SZ')
+
+
+def get_session_with_retries():
+    session = requests.Session()
+    retries = Retry(total=5, backoff_factor=1,
+                    status_forcelist=[429, 500, 502, 503, 504])
+    adapter = HTTPAdapter(max_retries=retries)
+    session.mount('https://', adapter)
+    session.mount('http://', adapter)
+    return session
 
 
 def fetch_cin7_orders(start_date: str, end_date: str) -> List[dict]:
@@ -52,11 +63,14 @@ def fetch_cin7_orders(start_date: str, end_date: str) -> List[dict]:
         CIN7_USERNAME, CIN7_PASSWORD)}
     url = f"{CIN7_API_BASE_URL}?fields={fields}&{where}&order=createdDate ASC&page={page}&rows={rows}"
 
-    response = requests.get(url, headers=headers)
-    if response.status_code == 200:
-        return response.json()
-    else:
-        return []
+    session = get_session_with_retries()
+    try:
+        response = session.get(url, headers=headers,
+                               timeout=10)
+        response.raise_for_status()
+        return response.json(), None
+    except requests.exceptions.RequestException as error:
+        return None, str(error)
 
 
 def prepare_cin7_updates(shopify_orders: List[ShopifyOrder], cin7_orders: List[dict]) -> List[dict]:
@@ -79,11 +93,14 @@ def update_cin7_orders(updates: List[dict]) -> dict:
         CIN7_USERNAME, CIN7_PASSWORD)}
     url = f"{CIN7_API_BASE_URL}"
 
-    response = requests.put(url, headers=headers, json=updates)
-    if response.status_code == 200:
+    session = get_session_with_retries()
+    try:
+        response = session.put(url, headers=headers,
+                               json=updates, timeout=10)
+        response.raise_for_status()
         return "Orders updated successfully"
-    else:
-        return {"message": "Failed to update orders", "error": response.text}
+    except requests.exceptions.RequestException as error:
+        return {"message": "Failed to update orders", "error": str(error)}
 
 
 @app.post("/shopify-orders/")
@@ -93,14 +110,17 @@ async def update_orders(payload: ShopifyPayload, request: Request):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
     start_date, end_date = determine_date_range(payload.orders)
+    cin7_orders, error = fetch_cin7_orders(start_date, end_date)
 
-    cin7_orders = fetch_cin7_orders(start_date, end_date)
+    if cin7_orders is None:
+        return {"message": "Failed to fetch orders from Cin7 due to an error.", "error": error}, 500
+    elif not cin7_orders:
+        return {"message": "No orders found in the specified date range."}, 200
 
     updates = prepare_cin7_updates(payload.orders, cin7_orders)
-
     update_cin7_orders(updates)
 
-    return {"message": "Orders updated successfully", "cin7 updates": len(updates)}
+    return {"message": f"Successful process. {len(updates)} orders updated."}
 
 
 if __name__ == "__main__":
